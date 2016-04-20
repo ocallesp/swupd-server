@@ -31,20 +31,29 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <openssl/evp.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+
 #include "swupd.h"
 
+
+bool signature_initialize(void);
+void signature_terminate(void);
+bool signature_sign(const char *);
+static char * get_signature_filename(const char *);
+static void create_signature(FILE *);
 static char *make_filename(const char *, const char *, const char *);
 
-static const char *CMD_FMT = "openssl smime -sign -in %s -binary "
-			     "-out %s.signed -outform PEM -md sha256 -inkey %s -signer %s "
-			     "-certfile %s -passin file:%s";
-
-static char *leaf_key = NULL;
-static char *leaf_cert = NULL;
-static char *ca_chain_cert = NULL;
+static FILE *fp_privkey = NULL;
+static FILE *fp_sig = NULL;
+static EVP_PKEY *pkey = NULL;
 static char *passphrase = NULL;
-
+static char *leaf_key = NULL;
 static bool initialized = false;
+
+
 
 /*
  * Initialize this module.
@@ -63,6 +72,9 @@ bool signature_initialize(void)
 	if (initialized) {
 		return true;
 	}
+    OpenSSL_add_all_algorithms();
+    ERR_load_crypto_strings();
+
 	cdir = getenv("SWUPD_CERTS_DIR");
 	if (cdir == NULL || cdir[0] == '\0') {
 		printf("No certificates directory specified\n");
@@ -77,14 +89,6 @@ bool signature_initialize(void)
 	if (leaf_key == NULL) {
 		goto err;
 	}
-	leaf_cert = make_filename(cdir, "LEAF_CERT", "leaf certificate");
-	if (leaf_cert == NULL) {
-		goto err;
-	}
-	ca_chain_cert = make_filename(cdir, "CA_CHAIN_CERT", "CA chain certificate");
-	if (ca_chain_cert == NULL) {
-		goto err;
-	}
 	pphr = getenv("PASSPHRASE");
 	if (pphr == NULL || (passphrase = strdup(pphr)) == NULL) {
 		goto err;
@@ -94,6 +98,19 @@ bool signature_initialize(void)
 		       strerror(errno));
 		goto err;
 	}
+
+    /* Read private key */
+    fp_privkey = fopen(leaf_key, "r");
+    if (!fp_privkey) {
+        fprintf(stderr, "Failed fopen %s\n",leaf_key);
+        exit(1);
+    }
+    pkey = PEM_read_PrivateKey(fp_privkey, NULL, NULL, (void *)passphrase);
+    if (!pkey) {
+        ERR_print_errors_fp(stderr);
+         exit(1);
+    }
+
 	initialized = true;
 	return true;
 err:
@@ -101,24 +118,25 @@ err:
 	return false;
 }
 
+
 /* Make filename from dir name and env variable containing basename */
 static char *make_filename(const char *dir, const char *env, const char *desc)
 {
-	char *fn = getenv(env);
-	char *result = NULL;
-	struct stat s;
+    char *fn = getenv(env);
+    char *result = NULL;
+    struct stat s;
 
-	if (fn == NULL || fn[0] == '\0') {
-		printf("No %s file specified\n", desc);
-		return NULL;
-	}
-	string_or_die(&result, "%s/%s", dir, fn);
-	if (stat(result, &s)) {
-		printf("Can't stat %s '%s' (%s)\n", desc, result, strerror(errno));
-		free(result);
-		return NULL;
-	}
-	return result;
+    if (fn == NULL || fn[0] == '\0') {
+        printf("No %s file specified\n", desc);
+        return NULL;
+    }
+    string_or_die(&result, "%s/%s", dir, fn);
+    if (stat(result, &s)) {
+        printf("Can't stat %s '%s' (%s)\n", desc, result, strerror(errno));
+        free(result);
+        return NULL;
+    }
+    return result;
 }
 
 /*
@@ -127,20 +145,27 @@ static char *make_filename(const char *dir, const char *env, const char *desc)
 void signature_terminate(void)
 {
 	if (!enable_signing) {
-		return;
+		return false;
 	}
 
 	free(leaf_key);
-	free(leaf_cert);
-	free(ca_chain_cert);
 	free(passphrase);
 
+    fclose(fp_privkey);
+    fclose(fp_sig);
+
+    fp_privkey = NULL;
+    fp_sig = NULL;
 	leaf_key = NULL;
-	leaf_cert = NULL;
-	ca_chain_cert = NULL;
 	passphrase = NULL;
 
-	initialized = false;
+    /* frees up the private key */
+    EVP_PKEY_free(pkey);
+    /* removes all ciphers and digests from the table */
+    EVP_cleanup();
+
+    initialized = false;
+    return true;
 }
 
 /*
@@ -150,8 +175,6 @@ void signature_terminate(void)
  */
 bool signature_sign(const char *filename)
 {
-	char *cmd = NULL;
-	int status;
 
 	if (!enable_signing) {
 		return true;
@@ -160,12 +183,95 @@ bool signature_sign(const char *filename)
 	if (!initialized) {
 		return false;
 	}
-	string_or_die(&cmd, CMD_FMT, filename, filename, leaf_key, leaf_cert,
-		      ca_chain_cert, passphrase);
-	status = system(cmd);
-	if (status) {
-		printf("Bad status %d from signing command:%s\n", status, cmd);
-	}
-	free(cmd);
-	return status == 0;
+
+   	FILE *fp_data = NULL;
+
+
+   	char *signature_filename = get_signature_filename(filename);
+   	printf("signature file: %s\n", signature_filename);
+
+
+   	/* read data from file */
+   	fp_data = fopen(filename, "r");
+   	if (!fp_data) {
+       	fprintf(stderr, "Failed fopen %s\n", filename);
+       	exit(1);
+   	}
+
+   	fp_sig = fopen(signature_filename, "w");
+   	if (!fp_sig) {
+       	fprintf(stderr, "Failed fopen %s\n", signature_filename);
+       	exit(1);
+   	}
+
+   	create_signature(fp_data);
+
+   	free(signature_filename);
+   	fclose(fp_data);
+
+    return true;
+}
+
+static char * get_signature_filename(const char *filename)
+{
+    char *signature_filename = NULL;
+    size_t len = 0;
+
+    len = strlen(filename);
+    signature_filename = (char *)malloc(len + 8);
+    sprintf(signature_filename,"%s.signed", filename);
+
+    return signature_filename;
+}
+
+
+
+#define BUFFER_SIZE   4096
+static void create_signature(FILE *fp_data)
+{
+    char buffer[BUFFER_SIZE];
+    unsigned char sig_buffer[4096];
+    unsigned int sig_len;
+    EVP_MD_CTX md_ctx;
+
+    /* get size of file */
+    fseek(fp_data, 0, SEEK_END);
+    size_t data_size = ftell(fp_data);
+    fseek(fp_data, 0, SEEK_SET);
+
+    if (!EVP_SignInit(&md_ctx, EVP_sha256())) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
+    /* read all bytes from file to calculate digest using sha256 and then sign it */
+    size_t len = 0;
+    size_t bytes_left = data_size;
+    while (bytes_left > 0) {
+        const size_t count = (bytes_left > BUFFER_SIZE ? BUFFER_SIZE : bytes_left);
+        len = fread(buffer, 1, count, fp_data);
+        if (len != count) {
+            fprintf(stderr, "Failed len!= count\n");
+            exit(1);
+        }
+
+        if (!EVP_SignUpdate(&md_ctx, buffer, len)) {
+            ERR_print_errors_fp(stderr);
+            exit(1);
+        }
+        bytes_left -= len;
+    }
+
+    /* Do the signature */
+    if (!EVP_SignFinal(&md_ctx, sig_buffer, &sig_len, pkey)) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
+    size_t sig_len_tmp = fwrite(sig_buffer, 1, sig_len, fp_sig);
+    if (sig_len_tmp != sig_len) {
+        fprintf(stderr, "Failed fwrite sign file\n");
+        exit(1);
+    }
+
 }
